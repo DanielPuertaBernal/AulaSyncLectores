@@ -35,6 +35,7 @@
 #include <MFRC522.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 
 // ── Pines RC522 ──────────────────────────────────────────
 #define SS_PIN    5
@@ -56,11 +57,19 @@ const char* DEVICE_LOCATION = "porteria_superior";
 
 // ── Antirrebote (ms) ────────────────────────────────────
 const unsigned long DEBOUNCE_MS = 3000;
+const unsigned long SYNC_INTERVAL_MS = 15000;
+const size_t MAX_QUEUE_EVENTS = 25;
+const char* PREF_NAMESPACE = "aulasync";
+const char* PREF_QUEUE_KEY = "nfcQueue";
 
 // ── Objetos globales ────────────────────────────────────
 MFRC522 rfid(SS_PIN, RST_PIN);
+Preferences preferences;
 String ultimoUID = "";
 unsigned long ultimaLectura = 0;
+unsigned long ultimoIntentoSync = 0;
+String colaPendiente[MAX_QUEUE_EVENTS];
+size_t totalPendientes = 0;
 
 // ══════════════════════════════════════════════════════════
 //  SETUP
@@ -68,6 +77,7 @@ unsigned long ultimaLectura = 0;
 void setup() {
   Serial.begin(115200);
   delay(500);
+  randomSeed((uint32_t)micros());
   Serial.println("\n=== AulaSync ESP32 RFID ===");
 
   // Pines de salida
@@ -93,8 +103,14 @@ void setup() {
   Serial.print("[OK] RC522 version: 0x");
   Serial.println(version, HEX);
 
+  preferences.begin(PREF_NAMESPACE, false);
+  cargarColaPendiente();
+
   // Conectar WiFi
   conectarWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    sincronizarPendientes();
+  }
 
   indicarListo();
   Serial.println("[OK] Sistema listo. Esperando tarjetas...\n");
@@ -108,6 +124,10 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WARN] WiFi desconectado. Reconectando...");
     conectarWiFi();
+  }
+
+  if (WiFi.status() == WL_CONNECTED && totalPendientes > 0 && (millis() - ultimoIntentoSync) >= SYNC_INTERVAL_MS) {
+    sincronizarPendientes();
   }
 
   // Verificar si hay tarjeta presente
@@ -134,11 +154,13 @@ void loop() {
   Serial.println(uid);
 
   // Enviar al servidor
-  bool exito = enviarLectura(uid);
+  const String eventoId = generarEventoId(uid);
+  bool exito = enviarLectura(uid, eventoId);
   if (exito) {
     indicarExito();
   } else {
-    indicarError();
+    encolarLectura(uid, eventoId);
+    indicarPendiente();
   }
 
   // Liberar tarjeta
@@ -196,7 +218,7 @@ String obtenerUID() {
  * Envía el UID al servidor AulaSync via HTTP POST
  * Returns true si el servidor respondió correctamente
  */
-bool enviarLectura(String uid) {
+bool enviarLectura(String uid, String eventoId) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[ERROR] Sin conexion WiFi.");
     return false;
@@ -209,7 +231,7 @@ bool enviarLectura(String uid) {
   http.setTimeout(5000);
 
   // JSON payload
-  String payload = "{\"id_carnet\":\"" + uid + "\",\"ubicacion\":\"" + String(DEVICE_LOCATION) + "\"}";
+  String payload = "{\"id_carnet\":\"" + uid + "\",\"ubicacion\":\"" + String(DEVICE_LOCATION) + "\",\"evento_id\":\"" + eventoId + "\"}";
   Serial.print("[HTTP] Enviando: ");
   Serial.println(payload);
 
@@ -222,12 +244,124 @@ bool enviarLectura(String uid) {
     Serial.print("): ");
     Serial.println(response);
     http.end();
-    return (httpCode == 200 || httpCode == 201);
+    return (httpCode >= 200 && httpCode < 300);
   } else {
     Serial.print("[ERROR] HTTP fallo: ");
     Serial.println(http.errorToString(httpCode));
     http.end();
     return false;
+  }
+}
+
+String generarEventoId(const String& uid) {
+  return String(DEVICE_LOCATION) + "-" + uid + "-" + String(millis()) + "-" + String(random(0xFFFF), HEX);
+}
+
+void cargarColaPendiente() {
+  totalPendientes = 0;
+  String rawQueue = preferences.getString(PREF_QUEUE_KEY, "");
+  if (!rawQueue.length()) return;
+
+  int start = 0;
+  while (start < rawQueue.length() && totalPendientes < MAX_QUEUE_EVENTS) {
+    int nextBreak = rawQueue.indexOf('\n', start);
+    if (nextBreak < 0) nextBreak = rawQueue.length();
+
+    String item = rawQueue.substring(start, nextBreak);
+    item.trim();
+    if (item.length()) {
+      colaPendiente[totalPendientes++] = item;
+    }
+    start = nextBreak + 1;
+  }
+
+  Serial.print("[QUEUE] Lecturas pendientes cargadas: ");
+  Serial.println(totalPendientes);
+}
+
+void guardarColaPendiente() {
+  String rawQueue = "";
+  for (size_t i = 0; i < totalPendientes; i++) {
+    if (i > 0) rawQueue += '\n';
+    rawQueue += colaPendiente[i];
+  }
+  preferences.putString(PREF_QUEUE_KEY, rawQueue);
+}
+
+bool existeEventoPendiente(const String& eventoId) {
+  for (size_t i = 0; i < totalPendientes; i++) {
+    if (colaPendiente[i].startsWith(eventoId + "|")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void eliminarPendienteEnIndice(size_t index) {
+  if (index >= totalPendientes) return;
+  for (size_t i = index; i + 1 < totalPendientes; i++) {
+    colaPendiente[i] = colaPendiente[i + 1];
+  }
+  if (totalPendientes > 0) {
+    colaPendiente[totalPendientes - 1] = "";
+    totalPendientes--;
+  }
+  guardarColaPendiente();
+}
+
+void encolarLectura(const String& uid, const String& eventoId) {
+  if (!eventoId.length() || existeEventoPendiente(eventoId)) return;
+
+  const String item = eventoId + "|" + uid;
+  if (totalPendientes >= MAX_QUEUE_EVENTS) {
+    Serial.println("[QUEUE] Cola llena, se elimina el registro mas antiguo.");
+    eliminarPendienteEnIndice(0);
+  }
+
+  colaPendiente[totalPendientes++] = item;
+  guardarColaPendiente();
+
+  Serial.print("[QUEUE] Lectura almacenada offline. Pendientes: ");
+  Serial.println(totalPendientes);
+}
+
+bool parsearPendiente(const String& item, String& eventoId, String& uid) {
+  int sep = item.indexOf('|');
+  if (sep <= 0) return false;
+
+  eventoId = item.substring(0, sep);
+  uid = item.substring(sep + 1);
+  eventoId.trim();
+  uid.trim();
+  return eventoId.length() && uid.length();
+}
+
+void sincronizarPendientes() {
+  if (WiFi.status() != WL_CONNECTED || totalPendientes == 0) return;
+
+  ultimoIntentoSync = millis();
+  Serial.print("[QUEUE] Sincronizando lecturas pendientes: ");
+  Serial.println(totalPendientes);
+
+  size_t index = 0;
+  while (index < totalPendientes) {
+    String eventoId;
+    String uid;
+
+    if (!parsearPendiente(colaPendiente[index], eventoId, uid)) {
+      eliminarPendienteEnIndice(index);
+      continue;
+    }
+
+    if (enviarLectura(uid, eventoId)) {
+      Serial.print("[QUEUE] Lectura sincronizada: ");
+      Serial.println(uid);
+      eliminarPendienteEnIndice(index);
+      indicarExito();
+    } else {
+      Serial.println("[QUEUE] No se pudo sincronizar, se reintentará luego.");
+      break;
+    }
   }
 }
 
@@ -253,6 +387,20 @@ void indicarError() {
     noTone(BUZZER_PIN);
     digitalWrite(LED_ERR_PIN, LOW);
     delay(100);
+  }
+}
+
+/**
+ * Señal de respaldo offline: 2 beeps medios + LED rojo corto
+ */
+void indicarPendiente() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(LED_ERR_PIN, HIGH);
+    tone(BUZZER_PIN, 1200, 120);
+    delay(180);
+    noTone(BUZZER_PIN);
+    digitalWrite(LED_ERR_PIN, LOW);
+    delay(120);
   }
 }
 
