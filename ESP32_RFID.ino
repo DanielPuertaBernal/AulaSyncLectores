@@ -17,17 +17,6 @@
  *   3.3V         →    3.3V
  * ══════════════════════════════════════════════════════════
  * 
- *   BUZZER (opcional, retroalimentación sonora)
- *   ─────────────────────────────
- *   Buzzer (+)   →    GPIO 2
- *   Buzzer (-)   →    GND
- * 
- *   LED indicador (opcional)
- *   ─────────────────────────────
- *   LED verde    →    GPIO 4  (lectura exitosa)
- *   LED rojo     →    GPIO 15 (error)
- * ══════════════════════════════════════════════════════════
- * 
  * IMPORTANTE: El RC522 opera a 3.3V. NO conectar a 5V.
  */
 
@@ -40,11 +29,6 @@
 // ── Pines RC522 ──────────────────────────────────────────
 #define SS_PIN    5
 #define RST_PIN   22
-
-// ── Pines indicadores ────────────────────────────────────
-#define BUZZER_PIN   2
-#define LED_OK_PIN   4
-#define LED_ERR_PIN  15
 
 // ── Configuración WiFi ──────────────────────────────────
 const char* WIFI_SSID     = "TU_RED_WIFI";
@@ -59,8 +43,15 @@ const char* DEVICE_LOCATION = "porteria_superior";
 const unsigned long DEBOUNCE_MS = 3000;
 const unsigned long SYNC_INTERVAL_MS = 15000;
 const size_t MAX_QUEUE_EVENTS = 25;
+const uint8_t MAX_SYNC_RETRIES = 5;
 const char* PREF_NAMESPACE = "aulasync";
 const char* PREF_QUEUE_KEY = "nfcQueue";
+
+enum SendResult {
+  SEND_OK,
+  SEND_RETRYABLE_ERROR,
+  SEND_PERMANENT_ERROR
+};
 
 // ── Objetos globales ────────────────────────────────────
 MFRC522 rfid(SS_PIN, RST_PIN);
@@ -80,14 +71,6 @@ void setup() {
   randomSeed((uint32_t)micros());
   Serial.println("\n=== AulaSync ESP32 RFID ===");
 
-  // Pines de salida
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_OK_PIN, OUTPUT);
-  pinMode(LED_ERR_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(LED_OK_PIN, LOW);
-  digitalWrite(LED_ERR_PIN, LOW);
-
   // Iniciar SPI y RC522
   SPI.begin();
   rfid.PCD_Init();
@@ -97,7 +80,6 @@ void setup() {
   byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
   if (version == 0x00 || version == 0xFF) {
     Serial.println("[ERROR] RC522 no detectado. Revisar conexiones.");
-    indicarError();
     while (true) { delay(1000); }
   }
   Serial.print("[OK] RC522 version: 0x");
@@ -112,7 +94,6 @@ void setup() {
     sincronizarPendientes();
   }
 
-  indicarListo();
   Serial.println("[OK] Sistema listo. Esperando tarjetas...\n");
 }
 
@@ -155,12 +136,14 @@ void loop() {
 
   // Enviar al servidor
   const String eventoId = generarEventoId(uid);
-  bool exito = enviarLectura(uid, eventoId);
-  if (exito) {
-    indicarExito();
-  } else {
+  SendResult resultado = enviarLectura(uid, eventoId);
+  if (resultado == SEND_OK) {
+    Serial.println("[NFC] Lectura enviada correctamente.");
+  } else if (resultado == SEND_RETRYABLE_ERROR) {
     encolarLectura(uid, eventoId);
-    indicarPendiente();
+    Serial.println("[NFC] Lectura almacenada en cola offline.");
+  } else {
+    Serial.println("[NFC] Lectura rechazada por servidor (error permanente). No se encola.");
   }
 
   // Liberar tarjeta
@@ -195,7 +178,6 @@ void conectarWiFi() {
     Serial.println(WiFi.localIP());
   } else {
     Serial.println("\n[ERROR] No se pudo conectar al WiFi.");
-    indicarError();
   }
 }
 
@@ -216,12 +198,12 @@ String obtenerUID() {
 
 /**
  * Envía el UID al servidor AulaSync via HTTP POST
- * Returns true si el servidor respondió correctamente
+ * Devuelve si fue exitoso, fallo reintentable o fallo permanente
  */
-bool enviarLectura(String uid, String eventoId) {
+SendResult enviarLectura(String uid, String eventoId) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[ERROR] Sin conexion WiFi.");
-    return false;
+    return SEND_RETRYABLE_ERROR;
   }
 
   HTTPClient http;
@@ -244,12 +226,21 @@ bool enviarLectura(String uid, String eventoId) {
     Serial.print("): ");
     Serial.println(response);
     http.end();
-    return (httpCode >= 200 && httpCode < 300);
+    if (httpCode >= 200 && httpCode < 300) {
+      return SEND_OK;
+    }
+
+    // Los 4xx (excepto 408 y 429) se tratan como errores permanentes para este payload.
+    if (httpCode >= 400 && httpCode < 500 && httpCode != 408 && httpCode != 429) {
+      return SEND_PERMANENT_ERROR;
+    }
+
+    return SEND_RETRYABLE_ERROR;
   } else {
     Serial.print("[ERROR] HTTP fallo: ");
     Serial.println(http.errorToString(httpCode));
     http.end();
-    return false;
+    return SEND_RETRYABLE_ERROR;
   }
 }
 
@@ -312,7 +303,7 @@ void eliminarPendienteEnIndice(size_t index) {
 void encolarLectura(const String& uid, const String& eventoId) {
   if (!eventoId.length() || existeEventoPendiente(eventoId)) return;
 
-  const String item = eventoId + "|" + uid;
+  const String item = construirItemPendiente(eventoId, uid, 0);
   if (totalPendientes >= MAX_QUEUE_EVENTS) {
     Serial.println("[QUEUE] Cola llena, se elimina el registro mas antiguo.");
     eliminarPendienteEnIndice(0);
@@ -325,15 +316,38 @@ void encolarLectura(const String& uid, const String& eventoId) {
   Serial.println(totalPendientes);
 }
 
-bool parsearPendiente(const String& item, String& eventoId, String& uid) {
-  int sep = item.indexOf('|');
-  if (sep <= 0) return false;
+String construirItemPendiente(const String& eventoId, const String& uid, uint8_t reintentos) {
+  return eventoId + "|" + uid + "|" + String(reintentos);
+}
 
-  eventoId = item.substring(0, sep);
-  uid = item.substring(sep + 1);
+bool parsearPendiente(const String& item, String& eventoId, String& uid, uint8_t& reintentos) {
+  int firstSep = item.indexOf('|');
+  if (firstSep <= 0) return false;
+
+  int secondSep = item.indexOf('|', firstSep + 1);
+  if (secondSep < 0) {
+    // Compatibilidad con formato anterior: evento|uid
+    eventoId = item.substring(0, firstSep);
+    uid = item.substring(firstSep + 1);
+    reintentos = 0;
+  } else {
+    eventoId = item.substring(0, firstSep);
+    uid = item.substring(firstSep + 1, secondSep);
+    String retryStr = item.substring(secondSep + 1);
+    retryStr.trim();
+    int parsedRetries = retryStr.toInt();
+    reintentos = parsedRetries < 0 ? 0 : (uint8_t)parsedRetries;
+  }
+
   eventoId.trim();
   uid.trim();
   return eventoId.length() && uid.length();
+}
+
+void actualizarPendienteEnIndice(size_t index, const String& eventoId, const String& uid, uint8_t reintentos) {
+  if (index >= totalPendientes) return;
+  colaPendiente[index] = construirItemPendiente(eventoId, uid, reintentos);
+  guardarColaPendiente();
 }
 
 void sincronizarPendientes() {
@@ -347,70 +361,45 @@ void sincronizarPendientes() {
   while (index < totalPendientes) {
     String eventoId;
     String uid;
+    uint8_t reintentos = 0;
 
-    if (!parsearPendiente(colaPendiente[index], eventoId, uid)) {
+    if (!parsearPendiente(colaPendiente[index], eventoId, uid, reintentos)) {
       eliminarPendienteEnIndice(index);
       continue;
     }
 
-    if (enviarLectura(uid, eventoId)) {
+    String expectedPrefix = String(DEVICE_LOCATION) + "-";
+    if (!eventoId.startsWith(expectedPrefix)) {
+      Serial.print("[QUEUE] Evento descartado por ubicacion invalida en evento_id: ");
+      Serial.println(eventoId);
+      eliminarPendienteEnIndice(index);
+      continue;
+    }
+
+    SendResult resultado = enviarLectura(uid, eventoId);
+    if (resultado == SEND_OK) {
       Serial.print("[QUEUE] Lectura sincronizada: ");
       Serial.println(uid);
       eliminarPendienteEnIndice(index);
-      indicarExito();
+    } else if (resultado == SEND_PERMANENT_ERROR) {
+      Serial.print("[QUEUE] Evento descartado por error permanente del servidor: ");
+      Serial.println(eventoId);
+      eliminarPendienteEnIndice(index);
     } else {
-      Serial.println("[QUEUE] No se pudo sincronizar, se reintentará luego.");
+      reintentos++;
+      if (reintentos >= MAX_SYNC_RETRIES) {
+        Serial.print("[QUEUE] Evento descartado por exceder reintentos: ");
+        Serial.println(eventoId);
+        eliminarPendienteEnIndice(index);
+        continue;
+      }
+
+      actualizarPendienteEnIndice(index, eventoId, uid, reintentos);
+      Serial.print("[QUEUE] No se pudo sincronizar. Reintento ");
+      Serial.print(reintentos);
+      Serial.print("/");
+      Serial.println(MAX_SYNC_RETRIES);
       break;
     }
   }
-}
-
-/**
- * Señal de lectura exitosa: beep corto + LED verde
- */
-void indicarExito() {
-  digitalWrite(LED_OK_PIN, HIGH);
-  tone(BUZZER_PIN, 2000, 150);
-  delay(200);
-  noTone(BUZZER_PIN);
-  digitalWrite(LED_OK_PIN, LOW);
-}
-
-/**
- * Señal de error: 3 beeps rápidos + LED rojo
- */
-void indicarError() {
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(LED_ERR_PIN, HIGH);
-    tone(BUZZER_PIN, 500, 100);
-    delay(150);
-    noTone(BUZZER_PIN);
-    digitalWrite(LED_ERR_PIN, LOW);
-    delay(100);
-  }
-}
-
-/**
- * Señal de respaldo offline: 2 beeps medios + LED rojo corto
- */
-void indicarPendiente() {
-  for (int i = 0; i < 2; i++) {
-    digitalWrite(LED_ERR_PIN, HIGH);
-    tone(BUZZER_PIN, 1200, 120);
-    delay(180);
-    noTone(BUZZER_PIN);
-    digitalWrite(LED_ERR_PIN, LOW);
-    delay(120);
-  }
-}
-
-/**
- * Señal de sistema listo: 2 beeps ascendentes
- */
-void indicarListo() {
-  tone(BUZZER_PIN, 1000, 100);
-  delay(150);
-  tone(BUZZER_PIN, 2000, 100);
-  delay(150);
-  noTone(BUZZER_PIN);
 }
